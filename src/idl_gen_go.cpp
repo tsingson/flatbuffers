@@ -134,6 +134,8 @@ class GoGenerator : public BaseGenerator {
  private:
   Namespace go_namespace_;
   Namespace *cur_name_space_;
+  // fixed array struct builder
+  std::map<std::string, std::string> fixed_array_struct_;
 
   struct NamespacePtrLess {
     bool operator()(const Namespace *a, const Namespace *b) const {
@@ -593,6 +595,106 @@ class GoGenerator : public BaseGenerator {
     code += "(builder *flatbuffers.Builder";
   }
 
+  // Begin the creator function signature.
+  void BeginFixedBuilderHeader(const StructDef &struct_def,
+                               std::string *code_ptr, const char *nameprefix,
+                               std::string step) {
+    std::string &code = *code_ptr;
+
+    if (code.substr(code.length() - 2) != "\n\n") {
+      // a previous mutate has not put an extra new line
+      code += "\n";
+    }
+    code += "func Create" + struct_def.name + step;
+    code += "(builder *flatbuffers.Builder";
+    for (auto it = struct_def.fields.vec.begin();
+         it != struct_def.fields.vec.end(); ++it) {
+      auto &field = **it;
+      if (IsStruct(field.value.type)) {
+        // Generate arguments for a struct inside a struct. To ensure names
+        // don't clash, and to make it obvious these arguments are constructing
+        // a nested struct, prefix the name with the field name.
+        StructBuilderArgs(*field.value.type.struct_def,
+                          (nameprefix + (field.name + "_")).c_str(), code_ptr);
+      } else if (IsArray(field.value.type)) {
+        std::string &code = *code_ptr;
+        code += std::string(", ") + nameprefix;
+        code += GoIdentity(field.name);
+        code += " " + NativeType(field.value.type);
+      } else {
+        std::string &code = *code_ptr;
+        code += std::string(", ") + nameprefix;
+        code += GoIdentity(field.name);
+        code += " " + TypeName(field);
+      }
+    }
+
+    code += ") flatbuffers.UOffsetT {\n";
+  }
+
+  void StructFixedBuilderBody(const StructDef &struct_def,
+                              const char *nameprefix, std::string *code_ptr) {
+    std::string &code = *code_ptr;
+
+    code += "\tbuilder.Prep(" + NumToString(struct_def.minalign) + ", ";
+    code += NumToString(struct_def.bytesize) + ")\n";
+
+    for (auto it = struct_def.fields.vec.rbegin();
+         it != struct_def.fields.vec.rend(); ++it) {
+      auto &field = **it;
+
+      auto is_array = IsArray(field.value.type);
+      const auto &field_type =
+          is_array ? field.value.type.VectorType() : field.value.type;
+
+      if (field.padding)
+        code += "\tbuilder.Pad(" + NumToString(field.padding) + ")\n";
+
+      if (is_array) {
+        // array handle
+        if (field_type.struct_def != nullptr) {
+          uint16_t len_ = static_cast<uint16_t>(field_type.fixed_length);
+          code += "\t// array struct field " + NumToString(len_) + " " +
+                  NumToString(field_type.struct_def->bytesize) + "\n";
+          len_ = len_ - 1;
+
+          code += "\t//";
+          code += "\t------------> " + NumToString(len_);
+          code += " >-----------------------\n";
+
+          code += "\tfor j := " + NumToString(len_) + "; j == 0; j-- {\n\t\t";
+          code += nameprefix + GoIdentity(field.name) + "[j].Pack(builder)\n";
+          code += "\t}\n";
+        } else {
+          uint16_t len_ = static_cast<uint16_t>(field.value.type.fixed_length);
+          len_ = len_ - 1;
+
+          code += "\tfor j := " + NumToString(len_) + "; j == 0; j-- {\n";
+          code += "\t\tbuilder.Prepend" + GenMethod(field) + "(";
+          code += CastToBaseType(field.value.type,
+                                 nameprefix + GoIdentity(field.name) + "[j]") +
+                  ")\n";
+          code += "\t}\n";
+        }
+        // array handle
+
+      } else if (IsStruct(field_type)) {
+        StructBuilderBody(*field.value.type.struct_def,
+                          (nameprefix + (field.name + "_")).c_str(), code_ptr);
+      } else {
+        code += "\tbuilder.Prepend" + GenMethod(field) + "(";
+        code += CastToBaseType(field.value.type,
+                               nameprefix + GoIdentity(field.name)) +
+                ")\n";
+      }
+    }
+  }
+
+  void EndFixedBuilderBody(std::string *code_ptr) {
+    std::string &code = *code_ptr;
+    code += "\treturn builder.Offset()\n";
+    code += "}\n";
+  }
   // Recursively generate arguments for a constructor, to deal with nested
   // structs.
   void StructBuilderArgs(const StructDef &struct_def, const char *nameprefix,
@@ -606,6 +708,11 @@ class GoGenerator : public BaseGenerator {
         // a nested struct, prefix the name with the field name.
         StructBuilderArgs(*field.value.type.struct_def,
                           (nameprefix + (field.name + "_")).c_str(), code_ptr);
+      } else if (IsArray(field.value.type)) {
+        std::string &code = *code_ptr;
+        code += std::string(", ") + nameprefix;
+        code += GoIdentity(field.name);
+        code += " " + NativeType(field.value.type);
       } else {
         std::string &code = *code_ptr;
         code += std::string(", ") + nameprefix;
@@ -631,9 +738,55 @@ class GoGenerator : public BaseGenerator {
     for (auto it = struct_def.fields.vec.rbegin();
          it != struct_def.fields.vec.rend(); ++it) {
       auto &field = **it;
+
+      auto is_array = IsArray(field.value.type);
+      const auto &field_type =
+          is_array ? field.value.type.VectorType() : field.value.type;
+
       if (field.padding)
         code += "\tbuilder.Pad(" + NumToString(field.padding) + ")\n";
-      if (IsStruct(field.value.type)) {
+
+      if (is_array) {
+        // array handle
+        if (field_type.struct_def != nullptr) {
+          code += "\t// array struct field " +
+                  NumToString(field_type.fixed_length) + " " +
+                  NumToString(field_type.struct_def->bytesize) + "\n";
+
+          uint16_t len_ = static_cast<uint16_t>(field.value.type.fixed_length);
+          len_ = len_ - 1;
+          code += "\t// " + NumToString(len_);
+          code += "-----------------------\n";
+          if (len_ > 0) {
+            code += "\t//-----------------------\n";
+            code += "\tfor j := " + NumToString(len_) + "; j == 0; j-- {\n\t\t";
+            code += nameprefix + GoIdentity(field.name) + "[j].Pack(builder)\n";
+            code += "\t}\n";
+          } else {
+            code += nameprefix + GoIdentity(field.name) + "[0].Pack(builder)\n";
+          }
+        } else {
+          uint16_t len_ = static_cast<uint16_t>(field.value.type.fixed_length);
+          len_ = len_ - 1;
+          if (len_ > 0) {
+            code += "\tfor j := " + NumToString(len_) + "; j == 0; j-- {\n";
+            code += "\t\tbuilder.Prepend" + GenMethod(field) + "(";
+            code +=
+                CastToBaseType(field.value.type,
+                               nameprefix + GoIdentity(field.name) + "[j]") +
+                ")\n";
+            code += "\t}\n";
+          } else {
+            code += "\t\tbuilder.Prepend" + GenMethod(field) + "(";
+            code +=
+                CastToBaseType(field.value.type,
+                               nameprefix + GoIdentity(field.name) + "[0]") +
+                ")\n";
+          }
+        }
+        // array handle
+
+      } else if (IsStruct(field_type)) {
         StructBuilderBody(*field.value.type.struct_def,
                           (nameprefix + (field.name + "_")).c_str(), code_ptr);
       } else {
@@ -766,6 +919,7 @@ class GoGenerator : public BaseGenerator {
           break;
         }
         case BASE_TYPE_UNION: GetUnionField(struct_def, field, code_ptr); break;
+        case BASE_TYPE_ARRAY: break;
         default: FLATBUFFERS_ASSERT(0);
       }
     }
@@ -914,8 +1068,12 @@ class GoGenerator : public BaseGenerator {
 
     // Generate builders
     if (struct_def.fixed) {
+      // use object api inside builder func
+      if (parser_.opts.generate_object_based_api) {
+        GenStructBuilder(struct_def, code_ptr);
+      }
       // create a struct constructor function
-      GenStructBuilder(struct_def, code_ptr);
+      GenStructFixedBuilder(struct_def, code_ptr);
     } else {
       // Create a set of functions that allow table construction.
       GenTableBuilders(struct_def, code_ptr);
@@ -1610,9 +1768,15 @@ class GoGenerator : public BaseGenerator {
 
   // Returns the method name for use with add/put calls.
   std::string GenMethod(const FieldDef &field) {
-    return IsScalar(field.value.type.base_type)
-               ? MakeCamel(GenTypeBasic(field.value.type))
-               : (IsStruct(field.value.type) ? "Struct" : "UOffsetT");
+    if (IsScalar(field.value.type.base_type)) {
+      return MakeCamel(GenTypeBasic(field.value.type));
+    } else if (IsArray(field.value.type)) {
+      return (field.value.type.struct_def != nullptr)
+                 ? "Struct"
+                 : MakeCamel(GenTypeBasic(field.value.type.VectorType()));
+    } else {
+      return (IsStruct(field.value.type) ? "Struct" : "UOffsetT");
+    }
   }
 
   std::string GenTypeBasic(const Type &type) {
@@ -1632,6 +1796,9 @@ class GoGenerator : public BaseGenerator {
       case BASE_TYPE_STRING: return "[]byte";
       case BASE_TYPE_VECTOR: return GenTypeGet(type.VectorType());
       case BASE_TYPE_STRUCT: return WrapInNameSpaceAndTrack(*type.struct_def);
+      case BASE_TYPE_ARRAY:
+        return "[" + NumToString(type.fixed_length) + "]" +
+               GenTypeGet(type.VectorType());
       case BASE_TYPE_UNION:
         // fall through
       default: return "*flatbuffers.Table";
@@ -1694,6 +1861,9 @@ class GoGenerator : public BaseGenerator {
       }
     } else if (type.base_type == BASE_TYPE_STRING) {
       return "string";
+    } else if (type.base_type == BASE_TYPE_ARRAY) {
+      return "[" + NumToString(type.fixed_length) + "]" +
+             NativeType(type.VectorType());
     } else if (type.base_type == BASE_TYPE_VECTOR) {
       return "[]" + NativeType(type.VectorType());
     } else if (type.base_type == BASE_TYPE_STRUCT) {
@@ -1744,6 +1914,95 @@ class GoGenerator : public BaseGenerator {
     StructBuilderBody(struct_def, "", code_ptr);
     EndBuilderBody(code_ptr);
   }
+
+  // Create a fixed array struct with a builder and the struct's arguments.
+  void GenStructFixedBuilder(const StructDef &struct_def,
+                             std::string *code_ptr) {
+    std::string &code = *code_ptr;
+    code += "// support fixed-length array.\n\n";
+
+    // find out fixed-length array in struct
+    std::vector<FieldDef> *temp_field_ = nullptr;
+    std::vector<std::vector<FieldDef> *> fixed_field_;
+    std::vector<FieldDef> *temp_ = nullptr;
+
+    for (auto it = struct_def.fields.vec.begin();
+         it != struct_def.fields.vec.end(); ++it) {
+      auto &field = **it;
+      auto is_array = IsArray(field.value.type);
+      const auto &field_type =
+          is_array ? field.value.type.VectorType() : field.value.type;
+
+      if (it == struct_def.fields.vec.begin()) {
+        temp_ = new std::vector<FieldDef>;
+      }
+
+      if ((is_array) && (field_type.struct_def != nullptr)) {
+        if (!(*temp_).empty()) {
+          temp_field_ = temp_;
+          fixed_field_.push_back(temp_field_);
+          temp_ = new std::vector<FieldDef>;
+        }
+        (*temp_).push_back(field);
+        temp_field_ = temp_;
+        fixed_field_.push_back(temp_field_);
+        temp_ = new std::vector<FieldDef>;
+      } else {
+        (*temp_).push_back(field);
+      }
+      if ((it == struct_def.fields.vec.end() - 1) && (!(*temp_).empty())) {
+        temp_field_ = temp_;
+        fixed_field_.push_back(temp_field_);
+      }
+    }
+
+    if (fixed_field_.empty()) return;
+
+    if (!fixed_field_.empty()) {
+      if (fixed_field_.size() > 1) {
+        for (auto it = fixed_field_.begin(); it != fixed_field_.end(); ++it) {
+          auto step = it - fixed_field_.begin() + 1;
+          //
+          for (auto j : **it) {
+            auto &field = j;
+            auto is_array = IsArray(field.value.type);
+            const auto &field_type =
+                is_array ? field.value.type.VectorType() : field.value.type;
+
+            code += "// step: " + NumToString(step);
+            code += " field name:  " + field.name;
+            code += " native type: " + NativeType(field.value.type);
+
+            if (field_type.struct_def != nullptr) {
+              code += " fixed_length in array: " +
+                      NumToString(field_type.fixed_length);
+              code += " struct bytesize: " +
+                      NumToString(field_type.struct_def->bytesize);
+            }
+            code += "\n";
+
+            //        BeginFixedBuilderHeader(field , code_ptr, "",
+            //        NumToString(offset));
+            //        //    StructBuilderArgs(struct_def, "", code_ptr);
+            //        //    EndBuilderArgs(code_ptr);
+            //
+            //        StructFixedBuilderBody(field, "", code_ptr);
+            //        EndFixedBuilderBody(code_ptr);
+          }
+          code += "// --------------------------------------\n";
+        }
+      } else {
+        BeginBuilderArgs(struct_def, code_ptr);
+        StructBuilderArgs(struct_def, "", code_ptr);
+        EndBuilderArgs(code_ptr);
+
+        StructBuilderBody(struct_def, "", code_ptr);
+        EndBuilderBody(code_ptr);
+      }
+    }
+    // generate builder as group
+  }
+
   // Begin by declaring namespace and imports.
   void BeginFile(const std::string &name_space_name, const bool needs_imports,
                  const bool is_enum, std::string *code_ptr) {
