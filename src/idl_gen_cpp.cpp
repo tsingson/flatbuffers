@@ -260,6 +260,8 @@ class CppGenerator : public BaseGenerator {
       auto name = Name(struct_def);
       code_.SetValue("STRUCT_NAME", name);
 
+      // TODO: tsingson's code reading
+
       // Create code to return the binary schema data.
       auto binary_schema_hex_text =
           BufferToHexText(parser_.builder_.GetBufferPointer(),

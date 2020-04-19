@@ -636,6 +636,7 @@ inline bool EscapeString(const char *s, size_t length, std::string *_text,
   return true;
 }
 
+// TODO: tsingson's code reading
 inline std::string BufferToHexText(const void *buffer, size_t buffer_size,
                                    size_t max_length,
                                    const std::string &wrapped_line_prefix,
