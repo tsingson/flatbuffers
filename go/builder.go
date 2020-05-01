@@ -349,9 +349,6 @@ func (b *Builder) CreateSharedString(s string) UOffsetT {
 
 // CreateString writes a null-terminated string as a vector.
 func (b *Builder) CreateString(s string) UOffsetT {
-	if len(s) == 0 {
-		return UOffsetT(0)
-	}
 	b.assertNotNested()
 	b.nested = true
 
@@ -384,9 +381,6 @@ func (b *Builder) CreateByteString(s []byte) UOffsetT {
 
 // CreateByteVector writes a ubyte vector
 func (b *Builder) CreateByteVector(v []byte) UOffsetT {
-	if len(v) == 0 {
-		return UOffsetT(0)
-	}
 	b.assertNotNested()
 	b.nested = true
 
